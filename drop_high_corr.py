@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-自动扫描项目根目录下的 xxx_features_filtered.csv / xxx_between_class_var.csv /
+自动扫描 ./data 目录下的 xxx_features_filtered.csv / xxx_between_class_var.csv /
 xxx_feature_correlation.csv 三件套，对每一组前缀 xxx 执行：
 
   1. 读取 xxx_features_filtered.csv（特征表）；
@@ -8,7 +8,7 @@ xxx_feature_correlation.csv 三件套，对每一组前缀 xxx 执行：
   3. 重新计算数值特征之间的相关矩阵；
   4. 查找 |corr| >= CORR_THRESHOLD 的特征对；
   5. 在每一对中删除“较差”的特征（优先保留类间方差更大者）；
-  6. 输出：
+  6. 输出到 ./cleaned_data 目录：
        - xxx_features_dedup_corr.csv              清洗后特征表
        - xxx_dropped_high_corr_features.csv       被删除的高度相关特征明细
        - xxx_feature_correlation_cleaned.csv      清洗后特征相关矩阵
@@ -23,14 +23,19 @@ from typing import List, Dict, Tuple
 # ===================== 参数区（主公按需修改） =====================
 
 # 相关性阈值：|corr| >= 该值视为“高度相关”
-CORR_THRESHOLD = 0.9
+CORR_THRESHOLD = 0.8
 
 # 是否使用 between_class_var 作为优先保留依据
 USE_BETWEEN_CLASS_VAR = True
 
 # 标签列名与元信息列名（不参与相关性与删除）
 LABEL_COL = "label"
-META_COLS = ["subject_id"]  # 若没有 subject_id，这一列会自动忽略
+# 这里兼容 subject-level 和 window-level，两种情况下不存在的列会自动跳过
+META_COLS = ["subject_id", "study", "segment_type", "window_idx"]
+
+# 输入 / 输出目录
+INPUT_DIR = Path("./data")
+OUTPUT_DIR = Path("./cleaned_data")
 
 
 # ===================== 工具函数 =====================
@@ -130,17 +135,17 @@ def process_one_dataset(features_path: Path):
     对单个前缀 xxx 对应的三件套文件执行去高相关特征操作。
 
     输入：
-      features_path: xxx_features_filtered.csv 路径
+      features_path: ./data 下的 xxx_features_filtered.csv 路径
     """
     # 解析前缀 xxx
-    stem = features_path.stem  # 例如: 'pd_subtype_win60s_features_filtered'
+    stem = features_path.stem  # 例如: 'pd_subtype_win60s_windowlevel_features_filtered'
     if not stem.endswith("_features_filtered"):
         print(f"[警告] 文件名不符合 '*_features_filtered.csv' 约定，已跳过: {features_path.name}")
         return
 
-    prefix = stem[:-len("_features_filtered")]  # 'pd_subtype_win60s'
+    prefix = stem[:-len("_features_filtered")]  # 'pd_subtype_win60s_windowlevel'
 
-    # 构造同目录下的另外两个文件路径
+    # 构造同目录下的另外两个文件路径（仍位于 ./data 中）
     between_path = features_path.with_name(f"{prefix}_between_class_var.csv")
     corr_input_path = features_path.with_name(f"{prefix}_feature_correlation.csv")
 
@@ -157,7 +162,7 @@ def process_one_dataset(features_path: Path):
     print(f"[信息] 类间方差表:   {between_path.name}")
     print(f"[信息] 原始相关矩阵: {corr_input_path.name}（仅用于存在性检查，本脚本会重新计算相关）")
 
-    # 读取特征表
+    # 读取特征表（从 ./data）
     df = pd.read_csv(features_path)
 
     # label / meta / feature 列集合
@@ -226,34 +231,41 @@ def process_one_dataset(features_path: Path):
     # 重新计算清洗后特征的相关性矩阵
     corr_clean = compute_corr_matrix(df_clean, feature_cols=cleaned_feature_cols)
 
-    # 输出文件名（与特征表同目录）
-    out_features = features_path.with_name(f"{prefix}_features_dedup_corr.csv")
-    out_dropped = features_path.with_name(f"{prefix}_dropped_high_corr_features.csv")
-    out_corr = features_path.with_name(f"{prefix}_feature_correlation_cleaned.csv")
+    # 确保输出目录存在
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 输出文件名（写到 ./cleaned_data 下）
+    out_features = OUTPUT_DIR / f"{prefix}_features_dedup_corr.csv"
+    out_dropped = OUTPUT_DIR / f"{prefix}_dropped_high_corr_features.csv"
+    out_corr = OUTPUT_DIR / f"{prefix}_feature_correlation_cleaned.csv"
 
     df_clean.to_csv(out_features, index=False, encoding="utf-8-sig")
-    print(f"[完成] 清洗后的特征表已保存至: {out_features.name}")
+    print(f"[完成] 清洗后的特征表已保存至: {out_features}")
 
     if drop_records:
         df_drop = pd.DataFrame(drop_records)
         df_drop.to_csv(out_dropped, index=False, encoding="utf-8-sig")
-        print(f"[完成] 被删除的高度相关特征明细已保存至: {out_dropped.name}")
+        print(f"[完成] 被删除的高度相关特征明细已保存至: {out_dropped}")
     else:
         print("[信息] 没有特征被删除，因此不生成 dropped 特征明细表。")
 
     corr_clean.to_csv(out_corr, encoding="utf-8-sig")
-    print(f"[完成] 清洗后特征的相关矩阵已保存至: {out_corr.name}")
+    print(f"[完成] 清洗后特征的相关矩阵已保存至: {out_corr}")
 
 
 def main():
-    # 项目根目录 = 当前工作目录
-    root = Path(".").resolve()
-    print(f"[信息] 扫描项目根目录: {root}")
+    # 输入目录 = ./data
+    root = INPUT_DIR.resolve()
+    print(f"[信息] 扫描输入目录: {root}")
+
+    if not INPUT_DIR.exists():
+        print(f"[警告] 输入目录不存在: {INPUT_DIR}")
+        return
 
     # 查找所有 *_features_filtered.csv
-    features_files = sorted(root.glob("*_features_filtered.csv"))
+    features_files = sorted(INPUT_DIR.glob("*_features_filtered.csv"))
     if not features_files:
-        print("[警告] 未在项目根目录下找到任何 '*_features_filtered.csv' 文件。")
+        print("[警告] 未在 ./data 下找到任何 '*_features_filtered.csv' 文件。")
         return
 
     print(f"[信息] 共发现 {len(features_files)} 个候选特征文件。")

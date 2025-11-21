@@ -1,2 +1,6 @@
 PD/
 *.csv
+AutogluonModels/
+autogluon_model/
+*.out
+NC/

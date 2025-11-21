@@ -1,139 +1,325 @@
 # -*- coding: utf-8 -*-
 """
-使用 AutoGluon TabularPredictor 在
-  ./cleaned_data/pd_subtype_win30s_features_dedup_corr.csv
-上的一键训练脚本。
+多窗口（三分类）帕金森/正常驾驶行为分类训练脚本（AutoGluon Tabular）
 
-特点：
-  - 自动丢弃 label 为空 / '-' 的样本；
-  - 按 subject_id 去重，保证一人一行；
-  - 检查每个类别的样本数：
-      * 若每个类 >= 2 且可以分出测试集，则做 stratify 划分 train/test；
-      * 若某个类样本数 < 2，则不划外部 test，全部数据用于训练，
-        只依赖 AutoGluon 内部的 validation 评估。
+功能：
+  - 针对不同时间窗口（例如 30s / 60s / 120s），依次读取 ./cleaned_data 下的特征文件；
+  - 每个时间窗口作为一次独立实验（experiment）顺序执行；
+  - 任务为 3 分类：两个 PD 亚型 + 正常组 nc；
+  - 划分方式严格按 subject_id 分组：
+      * 同一 subject_id 的所有窗口只会出现在 train / val / test 之一；
+  - 使用 TabularPredictor + presets 进行自动建模；
+  - 对每个实验：
+      * 打印训练/验证/测试集规模与标签分布；
+      * 打印完整 leaderboard（含各模型验证/测试分数与超参数）；
+      * 标记最优模型名称、验证/测试分数与其超参数；
+      * 将整个 Predictor（包含所有候选模型与最优模型）保存到指定目录。
 """
+
+from pathlib import Path
+import csv
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from sklearn.model_selection import train_test_split
+
 from autogluon.tabular import TabularPredictor
 
 
-DATA_PATH = "./cleaned_data/pd_subtype_win30s_features_dedup_corr.csv"
+# ===================== 全局配置 =====================
+
+# 清洗后的特征文件命名模板（与 extract_features.py + drop_high_corr.py 保持一致）
+# 例如：./cleaned_data/pd_nc_subtype_win30s_windowlevel_features_dedup_corr.csv
+CLEANED_DATA_DIR = Path("./cleaned_data")
+PREFIX = "pd_nc_subtype"
+WINDOW_SIZES = [30, 60, 120, 180, 300]   # 想比较哪些窗口，就写哪些秒数
+FILENAME_TEMPLATE = "{prefix}_win{win}s_windowlevel_features_dedup_corr.csv"
+RESULT_CSV = Path("window_results.csv")
+
+# 列名配置
 LABEL_COL = "label"
 SUBJECT_COL = "subject_id"
 
-TEST_SIZE = 0.2
+# 被试级划分比例（近似）
+TEST_SUBJECT_FRACTION = 0.2          # 测试集被试占全部被试的比例
+VAL_FRACTION_WITHIN_REST = 0.25      # 在非测试被试中，验证集被试比例（≈最终各 0.2）
+
 RANDOM_STATE = 42
 
-TAB_PRESETS = "best_quality"   # 或 "medium_quality"
-TIME_LIMIT = None              # 限时(秒)，不限制可设为 None
+# AutoGluon Tabular 配置
+TAB_PRESETS = "best_quality"         # 可改成 "medium_quality" 之类
+TIME_LIMIT = None                    # 限时(秒)，不限制可设为 None
+NUM_GPUS = 1                         # 如无 GPU，可改为 0 或 None
 
-MODEL_SAVE_PATH = "./autogluon_tabular_pd_win30s_model"
+# 模型保存根目录，每个窗口单独一个子目录
+MODEL_ROOT = Path("./models_tabular_multiclass")
+
+def append_window_result(window_name: str,
+                         best_model_name: str,
+                         metrics: dict):
+    """
+    把单个时间窗的结果追加写到 window_results.csv：
+    window_name, best_model_name, 以及 metrics 字典里的所有键值。
+    """
+    # 组装一行
+    row = {
+        "window": window_name,
+        "best_model": best_model_name,
+    }
+    row.update(metrics)
+
+    file_exists = RESULTS_CSV.exists()
+
+    # 注意：第一次写入要写表头，后面只追加数据行
+    with RESULTS_CSV.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+# ===================== 工具函数：按被试划分 =====================
+
+def split_by_subject(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    在 subject 级别上划分 train / val / test 被试集合，并映射回样本行（window-level）。
+
+    返回:
+        train_df, val_df, test_df
+    """
+    if SUBJECT_COL not in df.columns:
+        raise ValueError(f"数据集中未找到 subject_id 列 '{SUBJECT_COL}'，无法按人划分。")
+
+    # 被试级表：每个 subject_id 一行
+    subj_df = df[[SUBJECT_COL, LABEL_COL]].drop_duplicates(subset=[SUBJECT_COL]).reset_index(drop=True)
+
+    n_subjects = len(subj_df)
+    if n_subjects < 3:
+        print(f"[警告] 被试数量仅为 {n_subjects}，不足以划分有效的 train/val/test。")
+        print("       本次将不做外部划分，所有样本都作为训练集，"
+              "且 AutoGluon 仍会在内部做行级划分（无法完全避免同人泄漏）。")
+        return df.copy(), None, None
+
+    subj_labels = subj_df[LABEL_COL].to_numpy()
+    unique_labels, counts = np.unique(subj_labels, return_counts=True)
+    subj_label_counts = dict(zip(unique_labels, counts))
+    print(f"[信息] 被试级标签分布: {subj_label_counts}")
+
+    if len(unique_labels) == 1:
+        raise ValueError("在被试级上只有一个类别，无法进行 3 分类训练，请检查 label 列。")
+
+    # ---------- 第一步：划分 test 被试 ----------
+    min_count = counts.min()
+    can_stratify_subjects = min_count >= 2
+
+    print(f"[信息] 目标测试集被试比例: {TEST_SUBJECT_FRACTION} (按 subject 级)")
+    rest_subj_df, test_subj_df = train_test_split(
+        subj_df,
+        test_size=TEST_SUBJECT_FRACTION,
+        stratify=subj_labels if can_stratify_subjects else None,
+        random_state=RANDOM_STATE,
+    )
+
+    print(f"[信息] 被试划分后：训练+验证候选被试数量 = {len(rest_subj_df)}，测试被试数量 = {len(test_subj_df)}")
+
+    # ---------- 第二步：在剩余被试中划分 val 被试 ----------
+    val_subj_df = None
+    train_subj_df = rest_subj_df
+
+    if len(rest_subj_df) >= 3:
+        rest_labels = rest_subj_df[LABEL_COL].to_numpy()
+        uniq_rest, counts_rest = np.unique(rest_labels, return_counts=True)
+        can_stratify_rest = (len(uniq_rest) > 1 and counts_rest.min() >= 2)
+
+        print(f"[信息] 在非测试被试中划分验证集，被试比例约为 {VAL_FRACTION_WITHIN_REST}")
+        train_subj_df, val_subj_df = train_test_split(
+            rest_subj_df,
+            test_size=VAL_FRACTION_WITHIN_REST,
+            stratify=rest_labels if can_stratify_rest else None,
+            random_state=RANDOM_STATE,
+        )
+        print(f"[信息] 被试级划分结果：训练被试 = {len(train_subj_df)}，验证被试 = {len(val_subj_df)}")
+    else:
+        print("[警告] 训练+验证候选被试数量过少，跳过验证被试划分，本次无独立验证集。")
+
+    # ---------- 映射回样本行 ----------
+    train_subjects = set(train_subj_df[SUBJECT_COL].tolist())
+    test_subjects = set(test_subj_df[SUBJECT_COL].tolist())
+    val_subjects = set(val_subj_df[SUBJECT_COL].tolist()) if val_subj_df is not None else set()
+
+    assert train_subjects.isdisjoint(test_subjects)
+    assert train_subjects.isdisjoint(val_subjects)
+    assert test_subjects.isdisjoint(val_subjects)
+
+    train_df = df[df[SUBJECT_COL].isin(train_subjects)].reset_index(drop=True)
+    val_df = df[df[SUBJECT_COL].isin(val_subjects)].reset_index(drop=True) if val_subjects else None
+    test_df = df[df[SUBJECT_COL].isin(test_subjects)].reset_index(drop=True)
+
+    print(f"[信息] 样本级划分结果（行数）：训练 = {len(train_df)}, "
+          f"验证 = {len(val_df) if val_df is not None else 0}, 测试 = {len(test_df)}")
+
+    return train_df, val_df, test_df
 
 
-def main():
-    data_path = Path(DATA_PATH)
+# ===================== 单个窗口实验流程 =====================
+
+def run_experiment_for_window(win_size: int):
+    """
+    对某个时间窗口大小（秒）执行一次完整实验：
+      - 读取对应的 cleaned_data CSV；
+      - 按 subject 分 train/val/test；
+      - 训练多模型，输出 leaderboard；
+      - 评估测试集；
+      - 保存整个 Predictor。
+    """
+    filename = FILENAME_TEMPLATE.format(prefix=PREFIX, win=win_size)
+    data_path = CLEANED_DATA_DIR / filename
+
+    print("\n" + "=" * 80)
+    print(f"[实验] 开始窗口 {win_size}s 的实验")
+    print(f"[信息] 读取特征文件: {data_path.resolve()}")
+
     if not data_path.exists():
-        raise FileNotFoundError(f"特征文件不存在：{data_path.resolve()}")
+        print(f"[警告] 特征文件不存在，跳过该实验: {data_path}")
+        return
 
-    print(f"[信息] 读取数据文件: {data_path.resolve()}")
     df = pd.read_csv(data_path)
 
     if LABEL_COL not in df.columns:
-        raise ValueError(f"在 CSV 中未找到标签列 '{LABEL_COL}'，请检查列名。")
+        raise ValueError(f"在 {data_path.name} 中未找到标签列 '{LABEL_COL}'，请检查。")
+    if SUBJECT_COL not in df.columns:
+        raise ValueError(f"在 {data_path.name} 中未找到 subject 列 '{SUBJECT_COL}'，请检查。")
 
-    # 1. 丢弃 label 缺失或为 '-' 的样本
+    # 1. 丢弃 label 缺失 / '-' 的样本（理论上 PD/NC 都不再有 '-'，这里保险起见）
     before = len(df)
     df[LABEL_COL] = df[LABEL_COL].astype(str).str.strip()
     df = df[(df[LABEL_COL].notna()) & (df[LABEL_COL] != "") & (df[LABEL_COL] != "-")].copy()
     after = len(df)
-    print(f"[信息] 丢弃 label 为空或为 '-' 的样本 {before - after} 条，剩余 {after} 条。")
+    if before != after:
+        print(f"[信息] 丢弃 label 为空 / '-' 的样本 {before - after} 条，剩余 {after} 条。")
 
     if after == 0:
-        raise ValueError("过滤后没有任何带有效 label 的样本，无法训练。")
+        print("[警告] 有效样本为 0，跳过该实验。")
+        return
 
-    # 2. 按 subject_id 去重，一人一行
-    if SUBJECT_COL in df.columns:
-        before = len(df)
-        df = df.sort_values(SUBJECT_COL)
-        df = df.drop_duplicates(subset=[SUBJECT_COL], keep="first").reset_index(drop=True)
-        after = len(df)
-        print(f"[信息] 按 '{SUBJECT_COL}' 去重，一人一行：从 {before} 行降为 {after} 行。")
-    else:
-        print(f"[警告] 未找到 '{SUBJECT_COL}' 列，将直接对行做随机划分（假定一行=一人）。")
-
+    # 标签分布（行级）
     labels = df[LABEL_COL].to_numpy()
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    label_counts = dict(zip(unique_labels, counts))
-    print(f"[信息] 标签分布：{label_counts}")
+    uniq, cnts = np.unique(labels, return_counts=True)
+    print(f"[信息] 行级标签分布: {dict(zip(uniq, cnts))}")
+    print(f"[信息] 总样本行数: {len(df)}, 被试数: {df[SUBJECT_COL].nunique()}")
 
-    if len(unique_labels) == 1:
-        raise ValueError("当前数据只包含一个类别，无法进行二分类训练。请检查 label 列。")
+    # 2. 按 subject 划分 train / val / test
+    train_df, val_df, test_df = split_by_subject(df)
 
-    # 3. 判断是否可以安全地做 stratified train/test split
-    min_count = counts.min()
+    # 各集合标签分布
+    def print_label_dist(name: str, sub_df: pd.DataFrame):
+        if sub_df is None or len(sub_df) == 0:
+            print(f"  - {name}: 0 行")
+            return
+        labs = sub_df[LABEL_COL].to_numpy()
+        u, c = np.unique(labs, return_counts=True)
+        print(f"  - {name}: 行数 = {len(sub_df)}, 标签分布 = {dict(zip(u, c))}")
 
-    # 估计每个类别在测试集里期望的样本数（向下取整）
-    expected_test_per_class = (counts * TEST_SIZE).astype(int)
+    print("[信息] 各数据集标签分布：")
+    print_label_dist("train", train_df)
+    print_label_dist("val", val_df)
+    print_label_dist("test", test_df)
 
-    can_stratify = (
-        min_count >= 2 and             # 每个类至少 2 个
-        (expected_test_per_class >= 1).all()  # 测试集中每类至少能分到 1 个
-    )
-
-    if can_stratify:
-        print("[信息] 每个类别样本数足够，将使用 stratified train/test 划分。")
-        train_df, test_df = train_test_split(
-            df,
-            test_size=TEST_SIZE,
-            stratify=df[LABEL_COL],
-            random_state=RANDOM_STATE,
-        )
-        print(f"[信息] 训练集样本数: {len(train_df)}, 测试集样本数: {len(test_df)}")
-    else:
-        # 类别样本太少，放弃外部 test 划分
-        print("[警告] 至少有一个类别的样本数过少，无法安全进行分层 train/test 划分。")
-        print("       本次将不单独划分外部测试集，全部样本用于训练，")
-        print("       泛化性能请以 AutoGluon 内部的 validation 为准，")
-        print("       建议后续尽量增加样本量或补齐各类样本。")
-        train_df = df
-        test_df = None
-
-    # 4. 训练 TabularPredictor
-    print("[信息] 开始训练 AutoGluon TabularPredictor...")
+    # 3. 创建并训练 TabularPredictor（3 分类）
+    print("[信息] 开始训练 AutoGluon TabularPredictor (multiclass)...")
     predictor = TabularPredictor(
         label=LABEL_COL,
-        problem_type="binary",
-        eval_metric="accuracy",
+        problem_type="multiclass",
+        eval_metric="f1_macro",
     )
 
-    predictor.fit(
-        train_df,
+    fit_kwargs = dict(
         presets=TAB_PRESETS,
         time_limit=TIME_LIMIT,
-        num_gpus=1,
-        # 不显式给 tuning_data，让 AutoGluon 自动从 train_df 中切 validation
+        num_gpus=NUM_GPUS,
     )
+
+    if val_df is not None and len(val_df) > 0:
+        predictor.fit(
+            train_df,
+            tuning_data=val_df,
+            use_bag_holdout=True,   # 关键：在 bagging 模式下将 val_df 作为 holdout
+            **fit_kwargs,
+        )
+    else:
+        predictor.fit(
+            train_df,
+            **fit_kwargs,
+        )
 
     print("[信息] 训练完成。")
 
-    # 5. 如有外部测试集，则在其上评估
-    if test_df is not None:
+    # 4. 打印 leaderboard（含超参数）并标记最优模型
+    print("[信息] 生成 leaderboard（含超参数）...")
+    # 使用验证集存在则在验证集上，若无则在训练集上
+    ref_data = val_df if (val_df is not None and len(val_df) > 0) else train_df
+    lb = predictor.leaderboard(
+        ref_data,
+        extra_info=True,
+        silent=True,
+    )
+    print("[结果] Leaderboard（按 score_val 降序）：")
+    sort_col = "score_val" if "score_val" in lb.columns else lb.columns[1]
+    lb_sorted = lb.sort_values(by=sort_col, ascending=False)
+    cols_to_show = [c for c in [
+        "model", "score_val", "score_test", "fit_time", "pred_time_val", "hyperparameters"
+    ] if c in lb_sorted.columns]
+    print(lb_sorted[cols_to_show].to_string(index=False))
+
+        # 从 leaderboard 中选出最优模型（按 sort_col 排序后的第一行）
+    if len(lb_sorted) == 0:
+        print("[警告] leaderboard 为空，无法确定最优模型。")
+    else:
+        best_row = lb_sorted.iloc[0]
+        best_model = best_row["model"]
+        print(f"[信息] AutoGluon 选出的最优模型名称(按 {sort_col}): {best_model}")
+
+        best_score_val = best_row.get("score_val", None)
+        best_score_test = best_row.get("score_test", None)
+        best_hparams = best_row.get("hyperparameters", None)
+
+        print(f"[信息] 最优模型验证集分数(score_val): {best_score_val}")
+        if best_score_test is not None and not (
+            isinstance(best_score_test, float) and np.isnan(best_score_test)
+        ):
+            print(f"[信息] 最优模型测试集分数(score_test): {best_score_test}")
+        print(f"[信息] 最优模型超参数: {best_hparams}")
+
+    # 5. 在测试集上评估
+    if test_df is not None and len(test_df) > 0:
         print("[信息] 在外部测试集上评估模型性能...")
         test_metrics = predictor.evaluate(test_df)
         print("[结果] 测试集评估指标：")
         for k, v in test_metrics.items():
             print(f"    {k}: {v}")
     else:
-        print("[信息] 本次未划分外部测试集，可使用 predictor.leaderboard(train_df) 查看内部验证效果。")
+        print("[信息] 本次未划分外部测试集，可参考 leaderboard 中的验证集分数。")
 
-    # 6. 保存模型
-    save_path = Path(MODEL_SAVE_PATH)
-    save_path.mkdir(parents=True, exist_ok=True)
-    predictor.save(str(save_path))
-    print(f"[完成] 模型已保存至目录: {save_path.resolve()}")
+    # 6. 保存整个 Predictor（含最优模型和所有子模型）
+    MODEL_ROOT.mkdir(parents=True, exist_ok=True)
+    exp_model_dir = MODEL_ROOT / f"win{win_size}s"
+    # AutoGluon 不允许覆盖已有目录，若存在则先删除
+    if exp_model_dir.exists():
+        import shutil
+        shutil.rmtree(exp_model_dir)
+    predictor.save(str(exp_model_dir))
+    print(f"[完成] 窗口 {win_size}s 的完整模型已保存至: {exp_model_dir.resolve()}")
+
+
+# ===================== 主入口 =====================
+
+def main():
+    print("[信息] 多窗口三分类实验开始。")
+    print(f"[信息] 清洗特征目录: {CLEANED_DATA_DIR.resolve()}")
+    print(f"[信息] 模型保存根目录: {MODEL_ROOT.resolve()}")
+    for win in WINDOW_SIZES:
+        run_experiment_for_window(win)
+    print("[完成] 所有时间窗口实验已结束。")
 
 
 if __name__ == "__main__":
