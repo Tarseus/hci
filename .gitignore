@@ -4,3 +4,4 @@ AutogluonModels/
 autogluon_model/
 *.out
 NC/
+__pycache__/
