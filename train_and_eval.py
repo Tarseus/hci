@@ -268,16 +268,17 @@ def run_experiment_for_window(win_size: int) -> None:
             **fit_kwargs,
         )
 
+
     print("[信息] 训练完成。")
 
     # 4. 打印 leaderboard 并确定最优模型
     print("[信息] 生成 leaderboard（含超参数）...")
     ref_data = val_df if (val_df is not None and len(val_df) > 0) else train_df
     lb = predictor.leaderboard(
-        ref_data,
         extra_info=True,
         silent=True,
     )
+
     print("[结果] Leaderboard（按 score_val 降序）：")
 
     sort_col = "score_val" if "score_val" in lb.columns else lb.columns[1]
