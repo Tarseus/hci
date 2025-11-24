@@ -260,7 +260,6 @@ def run_experiment_for_window(win_size: int) -> None:
     if val_df is not None and len(val_df) > 0:
         predictor.fit(
             train_df,
-            tuning_data=val_df,
             **fit_kwargs,
         )
     else:

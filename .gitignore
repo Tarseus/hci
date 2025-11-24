@@ -1,7 +1,9 @@
 PD/
-*.csv
 AutogluonModels/
 autogluon_model/
 *.out
 NC/
 __pycache__/
+models_tabular_multiclass/
+cleaned_data/
+data/
