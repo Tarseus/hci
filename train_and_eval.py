@@ -247,7 +247,7 @@ def run_experiment_for_window(win_size: int) -> None:
     predictor = TabularPredictor(
         label=LABEL_COL,
         problem_type="multiclass",
-        eval_metric="f1_macro",
+        eval_metric="balanced_accuracy",
         path=str(exp_model_dir),
     )
 
