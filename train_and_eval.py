@@ -221,10 +221,11 @@ def run_experiment_for_window(win_size: int) -> None:
     # 2. 按 subject 划分 train / val / test
     train_df, val_df, test_df = split_by_subject(df)
 
-    # 去掉 subject_id，避免其作为特征参与训练 / 验证 / 测试
-    train_df_model = train_df.drop(columns=[SUBJECT_COL], errors="ignore")
-    val_df_model = val_df.drop(columns=[SUBJECT_COL], errors="ignore") if val_df is not None else None
-    test_df_model = test_df.drop(columns=[SUBJECT_COL], errors="ignore") if test_df is not None else None
+    # 去掉不会作为特征输入的元信息列
+    drop_cols = [SUBJECT_COL, "study", "segment_type", "window_idx"]
+    train_df_model = train_df.drop(columns=drop_cols, errors="ignore")
+    val_df_model = val_df.drop(columns=drop_cols, errors="ignore") if val_df is not None else None
+    test_df_model = test_df.drop(columns=drop_cols, errors="ignore") if test_df is not None else None
 
     # 各集合标签分布
     def print_label_dist(name: str, sub_df: pd.DataFrame) -> None:
@@ -272,7 +273,7 @@ def run_experiment_for_window(win_size: int) -> None:
     if val_df is not None and len(val_df) > 0:
         predictor.fit(
             train_data=train_df_model,
-            tuning_data=val_df,     # subject 级验证集
+            tuning_data=val_df_model,     # subject 级验证集
             use_bag_holdout=True,   # 允许 bagging 用 tuning_data 做 holdout
             **fit_kwargs,
         )
@@ -338,7 +339,7 @@ def run_experiment_for_window(win_size: int) -> None:
     test_metrics: Dict[str, float] = {}
     if test_df is not None and len(test_df) > 0:
         print("[信息] 在外部测试集上评估模型性能...")
-        eval_test_df = test_df.drop(columns=[SUBJECT_COL], errors="ignore")
+        eval_test_df = test_df.drop(columns=drop_cols, errors="ignore")
         test_metrics = predictor.evaluate(eval_test_df)
         print("[结果] 测试集评估指标：")
         for k, v in test_metrics.items():
