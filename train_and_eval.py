@@ -257,10 +257,17 @@ def run_experiment_for_window(win_size: int) -> None:
         num_gpus=NUM_GPUS,
     )
 
+    fit_kwargs = dict(
+        presets=TAB_PRESETS,
+        time_limit=TIME_LIMIT,
+        num_gpus=NUM_GPUS,
+    )
+
     if val_df is not None and len(val_df) > 0:
         predictor.fit(
             train_data=train_df,
-            tuning_data=val_df,   # 这里一定要有
+            tuning_data=val_df,     # subject 级验证集
+            use_bag_holdout=True,   # 允许 bagging 用 tuning_data 做 holdout
             **fit_kwargs,
         )
     else:
