@@ -24,6 +24,7 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
 
 from autogluon.tabular import TabularPredictor
 
@@ -220,6 +221,11 @@ def run_experiment_for_window(win_size: int) -> None:
     # 2. 按 subject 划分 train / val / test
     train_df, val_df, test_df = split_by_subject(df)
 
+    # 去掉 subject_id，避免其作为特征参与训练 / 验证 / 测试
+    train_df_model = train_df.drop(columns=[SUBJECT_COL], errors="ignore")
+    val_df_model = val_df.drop(columns=[SUBJECT_COL], errors="ignore") if val_df is not None else None
+    test_df_model = test_df.drop(columns=[SUBJECT_COL], errors="ignore") if test_df is not None else None
+
     # 各集合标签分布
     def print_label_dist(name: str, sub_df: pd.DataFrame) -> None:
         if sub_df is None or len(sub_df) == 0:
@@ -265,14 +271,14 @@ def run_experiment_for_window(win_size: int) -> None:
 
     if val_df is not None and len(val_df) > 0:
         predictor.fit(
-            train_data=train_df,
+            train_data=train_df_model,
             tuning_data=val_df,     # subject 级验证集
             use_bag_holdout=True,   # 允许 bagging 用 tuning_data 做 holdout
             **fit_kwargs,
         )
     else:
         predictor.fit(
-            train_data=train_df,
+            train_data=train_df_model,
             **fit_kwargs,
         )
 
@@ -332,10 +338,22 @@ def run_experiment_for_window(win_size: int) -> None:
     test_metrics: Dict[str, float] = {}
     if test_df is not None and len(test_df) > 0:
         print("[信息] 在外部测试集上评估模型性能...")
-        test_metrics = predictor.evaluate(test_df)
+        eval_test_df = test_df.drop(columns=[SUBJECT_COL], errors="ignore")
+        test_metrics = predictor.evaluate(eval_test_df)
         print("[结果] 测试集评估指标：")
         for k, v in test_metrics.items():
             print(f"    {k}: {v}")
+
+        # 额外输出：测试集混淆矩阵和分类报告，方便查看各类召回率
+        y_true = test_df[LABEL_COL].to_numpy()
+        y_pred = predictor.predict(eval_test_df)
+        classes = np.unique(y_true)
+        cm = confusion_matrix(y_true, y_pred, labels=classes)
+        print("[结果] 测试集混淆矩阵（行=真实标签, 列=预测标签）:")
+        print("labels:", list(classes))
+        print(cm)
+        print("[结果] 测试集分类报告：")
+        print(classification_report(y_true, y_pred, target_names=[str(c) for c in classes]))
     else:
         print("[信息] 本次未划分外部测试集，可参考 leaderboard 中的验证集分数。")
 
